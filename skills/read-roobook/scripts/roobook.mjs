@@ -2,14 +2,19 @@
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -47,6 +52,137 @@ export function parseWrapperArguments(arguments_) {
   return { forwarded, outputPath };
 }
 
+export function stageImportArguments(arguments_, options = {}) {
+  if (arguments_[0] !== "import") {
+    return { forwarded: arguments_, cleanup() {} };
+  }
+  const env = options.env ?? process.env;
+  const home = options.home ?? env.HOME;
+  if (!home) throw new Error("HOME is required to stage a PDF import.");
+  let sourceArgument;
+  let remaining;
+  if (arguments_[1] === "--file") {
+    sourceArgument = arguments_[2];
+    remaining = arguments_.slice(3);
+  } else {
+    sourceArgument = arguments_[1];
+    remaining = arguments_.slice(2);
+  }
+  if (!sourceArgument) throw new Error("Usage: roobook import <book.pdf>");
+  const source = realpathSync(resolve(sourceArgument));
+  if (!statSync(source).isFile() || !source.toLowerCase().endsWith(".pdf")) {
+    throw new Error("Import source must be an existing PDF file.");
+  }
+  const root = options.importRoot
+    ?? env.ROOBOOK_AGENT_IMPORT_ROOT
+    ?? join(
+      home,
+      "Library",
+      "Containers",
+      "app.roobook",
+      "Data",
+      "Library",
+      "Application Support",
+      "RooBook",
+      "ImportSources",
+    );
+  const jobId = options.jobId ?? randomUUID();
+  const directory = join(root, jobId.toLowerCase());
+  const staged = join(directory, basename(source));
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  copyFileSync(source, staged);
+  return {
+    forwarded: ["import", "--file", staged, ...remaining],
+    jobId,
+    staged,
+    cleanup() {
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+export function importHandoff(executable, staged, options = {}) {
+  const jobId = options.jobId ?? randomUUID();
+  const appBundle = dirname(dirname(dirname(executable)));
+  const submit = (options.spawn ?? spawnSync)(
+    executable,
+    ["--agent-cli", "submit-import", "--job", jobId, "--file", staged],
+    {
+      encoding: "utf8",
+      env: options.env ?? process.env,
+      timeout: options.timeout ?? 10_000,
+    },
+  );
+  if (submit.error) throw submit.error;
+  if (submit.status !== 0) {
+    throw new Error(submit.stderr?.trim() || "RooBook rejected the import handoff.");
+  }
+  const result = (options.spawn ?? spawnSync)(
+    options.openExecutable ?? "/usr/bin/open",
+    ["-g", "-a", appBundle],
+    {
+      encoding: "utf8",
+      env: options.env ?? process.env,
+      timeout: options.timeout ?? 10_000,
+    },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || "RooBook could not start for the import handoff.");
+  }
+  const queued = options.queuePath
+    ? waitForImportQueue(options.queuePath, jobId, options.queueWaitMs ?? 10_000)
+    : undefined;
+  return {
+    jobId,
+    status: queued?.state ?? "submitted",
+    progress: queued?.progress,
+    message: queued?.message,
+    bookId: queued?.bookId,
+    file: basename(staged),
+    appBundle,
+  };
+}
+
+export function waitForImportQueue(queuePath, jobId, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  do {
+    try {
+      const snapshot = JSON.parse(readFileSync(queuePath, "utf8"));
+      const item = snapshot.items?.find(
+        (candidate) => candidate.id?.toLowerCase() === jobId.toLowerCase(),
+      );
+      if (item) return item;
+    } catch {
+      // Atomic replacement or first launch can briefly leave no readable file.
+    }
+    Atomics.wait(sleeper, 0, 0, 100);
+  } while (Date.now() < deadline);
+  return undefined;
+}
+
+export function resolveSharedPaths(executable, options = {}) {
+  const result = (options.spawn ?? spawnSync)(
+    executable,
+    ["--agent-cli", "paths"],
+    {
+      encoding: "utf8",
+      env: options.env ?? process.env,
+      timeout: options.timeout ?? 10_000,
+    },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || "RooBook shared paths are unavailable.");
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new Error("RooBook returned invalid shared path metadata.");
+  }
+}
+
 export function installShellCommand(options = {}) {
   const env = options.env ?? process.env;
   const home = options.home ?? env.HOME;
@@ -67,11 +203,19 @@ export function installShellCommand(options = {}) {
     ?? join(home, ".local", "bin");
   const destination = join(binDirectory, "roobook");
   const temporary = `${destination}.tmp-${process.pid}`;
-  const quotedExecutable = `'${executable.replaceAll("'", `'\\''`)}'`;
+  const wrapperDirectory = join(home, ".local", "share", "roobook-cli");
+  const wrapperDestination = join(wrapperDirectory, "roobook.mjs");
+  const wrapperTemporary = `${wrapperDestination}.tmp-${process.pid}`;
+  const wrapperSource = realpathSync(fileURLToPath(import.meta.url));
+  const quotedWrapper = `'${wrapperDestination.replaceAll("'", `'\\''`)}'`;
   mkdirSync(binDirectory, { recursive: true });
+  mkdirSync(wrapperDirectory, { recursive: true });
+  copyFileSync(wrapperSource, wrapperTemporary);
+  chmodSync(wrapperTemporary, 0o755);
+  renameSync(wrapperTemporary, wrapperDestination);
   writeFileSync(
     temporary,
-    `#!/bin/sh\nexec ${quotedExecutable} --agent-cli "$@"\n`,
+    `#!/bin/sh\nexec /usr/bin/env node ${quotedWrapper} "$@"\n`,
     { mode: 0o755 },
   );
   chmodSync(temporary, 0o755);
@@ -79,6 +223,7 @@ export function installShellCommand(options = {}) {
   return {
     destination,
     binDirectory,
+    wrapperDestination,
     pathConfigured: (env.PATH ?? "").split(":").includes(binDirectory),
   };
 }
@@ -98,11 +243,37 @@ export function run(arguments_ = process.argv.slice(2), options = {}) {
     return 0;
   }
   const executable = options.executable ?? resolveRooBookExecutable(options);
-  const { forwarded, outputPath } = parseWrapperArguments(arguments_);
+  const parsed = parseWrapperArguments(arguments_);
+  const sharedPaths = parsed.forwarded[0] === "import"
+    && !options.importRoot
+    && !options.env?.ROOBOOK_AGENT_IMPORT_ROOT
+    ? resolveSharedPaths(executable, options)
+    : undefined;
+  const importOptions = sharedPaths
+    ? {
+        ...options,
+        importRoot: sharedPaths.importSources,
+      }
+    : options;
+  const staged = stageImportArguments(parsed.forwarded, importOptions);
   let outputDescriptor;
+  let preserveStagedImport = false;
   try {
-    outputDescriptor = outputPath ? openSync(outputPath, "w") : "inherit";
-    const result = spawnSync(executable, ["--agent-cli", ...forwarded], {
+    if (parsed.forwarded[0] === "import") {
+      const handoff = importHandoff(executable, staged.staged, {
+        ...options,
+        env: options.env ?? process.env,
+        jobId: staged.jobId,
+        queuePath: sharedPaths?.importQueue,
+      });
+      const output = `${JSON.stringify(handoff, null, 2)}\n`;
+      if (parsed.outputPath) writeFileSync(parsed.outputPath, output);
+      else process.stdout.write(output);
+      preserveStagedImport = true;
+      return 0;
+    }
+    outputDescriptor = parsed.outputPath ? openSync(parsed.outputPath, "w") : "inherit";
+    const result = spawnSync(executable, ["--agent-cli", ...staged.forwarded], {
       env: options.env ?? process.env,
       stdio: ["inherit", outputDescriptor, "inherit"],
     });
@@ -110,6 +281,7 @@ export function run(arguments_ = process.argv.slice(2), options = {}) {
     return result.status ?? 1;
   } finally {
     if (typeof outputDescriptor === "number") closeSync(outputDescriptor);
+    if (!preserveStagedImport) staged.cleanup();
   }
 }
 
