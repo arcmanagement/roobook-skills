@@ -11,6 +11,9 @@ Use the signed RooBook Mac app as the data plane. Keep single-book reading and s
 
 Resolve this skill's directory from the loaded `SKILL.md`. Use its `scripts/roobook.mjs` wrapper.
 
+- In Codex, follow [references/codex.md](references/codex.md) and invoke the skill as `$read-roobook`.
+- In Claude Code, follow [references/claude-code.md](references/claude-code.md), where `${CLAUDE_SKILL_DIR}` resolves the installed skill directory, and invoke it as `/read-roobook`.
+
 1. If `command -v roobook` succeeds, run `roobook help` and require `RooBook AI CLI` in the output.
 2. Otherwise run `node <skill-dir>/scripts/roobook.mjs install-shell-command`.
 3. If the command is installed but the current shell has not reloaded PATH, continue with `node <skill-dir>/scripts/roobook.mjs`; do not block the task.
@@ -46,4 +49,3 @@ roobook logs --since 15m --level warning --limit 200
 Narrow with `--book`, `--job`, or `--subsystem ingest|figures|cli`; use `--follow` only while actively monitoring. Logs contain operational metadata, not book text or credentials.
 
 Read [references/commands.md](references/commands.md) for all command shapes and [references/troubleshooting.md](references/troubleshooting.md) when bootstrap or cache access fails.
-
