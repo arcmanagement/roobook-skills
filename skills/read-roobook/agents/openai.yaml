@@ -1,0 +1,4 @@
+interface:
+  display_name: "Read RooBook"
+  short_description: "Search and read local RooBook documents"
+  default_prompt: "Use $read-roobook to search my RooBook library and cite the relevant pages."
